@@ -16,6 +16,26 @@ defmodule Jido.Chat.Adapter do
   `authenticate/4` and the existing `:authenticate` capability. Core owns only
   request validation and delegation; adapters own challenges and session state,
   while authorized hosts own durable persistence and runtime activation.
+
+  File hosts can query `file_requirements/2`, encode an exact candidate with
+  `prepare_upload/4`, then submit it once with `upload_prepared/3`. Limits for
+  individual files, post counts and encoded requests are independent. Prepared
+  bodies contain file bytes and must not be logged or placed in durable handles.
+  Preparation performs no file or network I/O: hosts materialize candidates first.
+  Providers keep multipart encoding and identity confirmation; hosts select
+  batches and own sequencing, failure policy and retries. For example:
+
+      {:ok, limits} = Adapter.file_requirements(provider, opts)
+      {:ok, prepared} = Adapter.prepare_upload(provider, room, candidates, opts)
+      {:ok, uploaded} = Adapter.upload_prepared(provider, prepared, opts)
+      Adapter.post_message(provider, room, PostPayload.text("Caption"),
+        Keyword.put(opts, :uploaded_files, uploaded.files))
+
+  The provider must implement these optional callbacks. Existing text operations
+  and adapters remain compatible. An uploaded reference is a provider result,
+  never proof manufactured from an input filename; only a confirmed publication
+  response establishes message membership. Restored message edits accept explicit
+  `uploaded_files` through their existing options without reuploading.
   """
 
   alias Jido.Chat.{
@@ -98,6 +118,56 @@ defmodule Jido.Chat.Adapter do
   @type participants_result :: {:ok, [Participant.t()]} | {:error, term()}
   @type read_result :: :ok | {:error, term()}
   @type file_input :: FileUpload.input()
+
+  @type file_limit :: pos_integer() | :unresolved | :not_applicable
+  @type file_requirements :: %{
+          max_file_size: file_limit(),
+          max_files_per_post: file_limit(),
+          max_upload_request_size: file_limit()
+        }
+  @type prepared_upload :: %{
+          channel_id: external_room_id(),
+          body: binary(),
+          content_type: String.t(),
+          size_bytes: non_neg_integer(),
+          files: [map()]
+        }
+  @type uploaded_files :: %{files: [map()]}
+
+  @doc """
+  Returns independently configured file, post-count and encoded-request limits.
+
+  Use `:unresolved` when configuration is missing, and `:not_applicable` only
+  when a limit does not apply. Never derive the request ceiling from file size.
+  This operation performs no I/O and must not discover remote configuration.
+  """
+  @callback file_requirements(keyword()) :: {:ok, file_requirements()} | {:error, term()}
+
+  @doc """
+  Encodes exactly the supplied materialized candidate without file or network I/O.
+
+  The result retains the exact body and content type that `c:upload_prepared/2`
+  submits. The host selects candidates; neither callback splits, retries or
+  publishes posts. Files requiring filesystem reads must be materialized first.
+  Prepared bodies contain private content and must not be logged.
+  """
+  @callback prepare_upload(external_room_id(), [FileUpload.t() | map()], keyword()) ::
+              {:ok, prepared_upload()} | {:error, term()}
+
+  @doc """
+  Submits one prepared upload in one HTTP attempt, without retry or publication.
+
+  Returns ordered provider-confirmed files, each with a unique nonempty `:id`.
+  Never substitute an input ID or filename for missing provider confirmation.
+  Providers return neutral errors and distinguish unconfirmed remote outcomes.
+  Hosts pass these references to existing post/edit operations as
+  `uploaded_files: result.files`; adapters validate them and publish one post.
+  Adapters opt into `uploaded_files: :native` with an exported `post_message/3`;
+  edits additionally require `edit_attachments: :native`. Unsupported adapters
+  reject references before publication rather than silently posting only text.
+  """
+  @callback upload_prepared(prepared_upload(), keyword()) ::
+              {:ok, uploaded_files()} | {:error, term()}
   @type media_reference :: String.t() | Media.t() | map()
 
   @core_fallback_capabilities [
@@ -298,7 +368,10 @@ defmodule Jido.Chat.Adapter do
   @callback authenticate(authentication_request(), owner_id :: term(), keyword()) ::
               authentication_result()
 
-  @optional_callbacks prepare_connection: 1,
+  @optional_callbacks file_requirements: 1,
+                      prepare_upload: 3,
+                      upload_prepared: 2,
+                      prepare_connection: 1,
                       provider_child_specs: 1,
                       connection_identity: 1,
                       connection_options: 2,
@@ -493,10 +566,106 @@ defmodule Jido.Chat.Adapter do
   @doc "Normalizes adapter send results to `Jido.Chat.Response`."
   @spec send_message(module(), external_room_id(), String.t(), keyword()) :: send_result()
   def send_message(adapter_module, external_room_id, text, opts \\ []) do
-    with {:ok, response} <- adapter_module.send_message(external_room_id, text, opts) do
+    with :ok <- validate_uploaded_options(adapter_module, opts),
+         {:ok, response} <- adapter_module.send_message(external_room_id, text, opts) do
       {:ok, normalize_response(adapter_module, response)}
     end
   end
+
+  @doc "Returns provider file requirements without remote discovery or inferred limits."
+  @spec file_requirements(module(), keyword()) :: {:ok, file_requirements()} | {:error, term()}
+  def file_requirements(adapter, opts \\ []) do
+    if callback_exported?(adapter, :file_requirements, 1) do
+      case adapter.file_requirements(opts) do
+        {:ok, %{} = limits} ->
+          if Enum.all?([:max_file_size, :max_files_per_post, :max_upload_request_size], fn key ->
+               value = Map.get(limits, key)
+               value in [:unresolved, :not_applicable] or (is_integer(value) and value > 0)
+             end),
+             do: {:ok, limits},
+             else: {:error, :invalid_file_requirements}
+
+        {:error, _} = error ->
+          error
+
+        _ ->
+          {:error, :invalid_file_requirements}
+      end
+    else
+      {:error, :unsupported}
+    end
+  end
+
+  @doc "Encodes exactly the supplied candidate without uploading or selecting batches."
+  @spec prepare_upload(module(), external_room_id(), [file_input()], keyword()) ::
+          {:ok, prepared_upload()} | {:error, term()}
+  def prepare_upload(adapter, room_id, files, opts \\ []) do
+    if callback_exported?(adapter, :prepare_upload, 3) do
+      case adapter.prepare_upload(room_id, files, opts) do
+        {:ok, prepared} ->
+          if valid_prepared_upload?(prepared) and prepared.channel_id == room_id,
+            do: {:ok, prepared},
+            else: {:error, :invalid_prepared_upload}
+
+        {:error, _} = error ->
+          error
+
+        _ ->
+          {:error, :invalid_prepared_upload}
+      end
+    else
+      {:error, :unsupported}
+    end
+  end
+
+  @doc "Submits one exact prepared candidate and returns only confirmed upload references."
+  @spec upload_prepared(module(), prepared_upload(), keyword()) ::
+          {:ok, uploaded_files()} | {:error, term()}
+  def upload_prepared(adapter, prepared, opts \\ []) do
+    cond do
+      not callback_exported?(adapter, :upload_prepared, 2) ->
+        {:error, :unsupported}
+
+      not valid_prepared_upload?(prepared) ->
+        {:error, :invalid_prepared_upload}
+
+      true ->
+        case adapter.upload_prepared(prepared, opts) do
+          {:ok, %{files: files} = result} when is_list(files) ->
+            ids = if valid_prepared_files?(files), do: Enum.map(files, &Map.get(&1, :id)), else: []
+
+            if valid_prepared_files?(files) and length(files) == length(prepared.files) and
+                 length(Enum.uniq(ids)) == length(ids) and
+                 Enum.all?(ids, &(is_binary(&1) and String.trim(&1) != "")),
+               do: {:ok, result},
+               else: {:error, :unconfirmed_upload}
+
+          {:error, _} = error ->
+            error
+
+          _ ->
+            {:error, :unconfirmed_upload}
+        end
+    end
+  end
+
+  defp valid_prepared_upload?(%{
+         channel_id: channel_id,
+         body: body,
+         content_type: content_type,
+         size_bytes: size,
+         files: [_ | _] = files
+       }) do
+    (is_binary(channel_id) or is_integer(channel_id)) and is_binary(body) and
+      is_binary(content_type) and String.trim(content_type) != "" and size == byte_size(body) and
+      valid_prepared_files?(files)
+  end
+
+  defp valid_prepared_upload?(_), do: false
+
+  defp valid_prepared_files?([]), do: true
+  defp valid_prepared_files?([file | rest]) when is_map(file), do: valid_prepared_files?(rest)
+  defp valid_prepared_files?(_), do: false
 
   @doc "Uploads and sends a file when supported by the adapter."
   @spec send_file(module(), external_room_id(), file_input(), keyword()) :: send_result()
@@ -521,6 +690,9 @@ defmodule Jido.Chat.Adapter do
     upload_candidates = PostPayload.upload_candidates(payload)
 
     cond do
+      validate_uploaded_options(adapter_module, adapter_opts) != :ok ->
+        {:error, :uploaded_files_unsupported}
+
       callback_exported?(adapter_module, :post_message, 3) ->
         with {:ok, response} <-
                adapter_module.post_message(external_room_id, payload, adapter_opts) do
@@ -639,13 +811,27 @@ defmodule Jido.Chat.Adapter do
           send_result()
   def edit_message(adapter_module, external_room_id, external_message_id, text, opts \\ []) do
     if callback_exported?(adapter_module, :edit_message, 4) do
-      with {:ok, response} <-
+      with :ok <- validate_uploaded_options(adapter_module, opts),
+           :ok <- validate_uploaded_edit(adapter_module, opts),
+           {:ok, response} <-
              adapter_module.edit_message(external_room_id, external_message_id, text, opts) do
         {:ok, normalize_response(adapter_module, Map.put(response, :status, :edited))}
       end
     else
       {:error, :unsupported}
     end
+  end
+
+  defp validate_uploaded_options(adapter, opts) do
+    if not is_nil(opts[:uploaded_files]) and capabilities(adapter)[:uploaded_files] != :native,
+      do: {:error, :uploaded_files_unsupported},
+      else: :ok
+  end
+
+  defp validate_uploaded_edit(adapter, opts) do
+    if not is_nil(opts[:uploaded_files]) and capabilities(adapter)[:edit_attachments] != :native,
+      do: {:error, :edit_attachments_unsupported},
+      else: :ok
   end
 
   @doc "Deletes a previously-sent message when supported by adapter."
@@ -1198,7 +1384,7 @@ defmodule Jido.Chat.Adapter do
                     [{capability, :missing_fallback} | acc]
                   end
 
-                {:unsupported, true} when capability == :edit_attachments ->
+                {:unsupported, true} when capability in [:edit_attachments, :uploaded_files] ->
                   acc
 
                 {:unsupported, true} ->
@@ -1794,6 +1980,10 @@ defmodule Jido.Chat.Adapter do
 
   defp ensure_capability_defaults(matrix, adapter_module) do
     defaults = %{
+      uploaded_files: :unsupported,
+      file_requirements: inferred_capability_status(adapter_module, :file_requirements),
+      prepare_upload: inferred_capability_status(adapter_module, :prepare_upload),
+      upload_prepared: inferred_capability_status(adapter_module, :upload_prepared),
       initialize: inferred_capability_status(adapter_module, :initialize),
       authenticate: inferred_capability_status(adapter_module, :authenticate),
       shutdown: inferred_capability_status(adapter_module, :shutdown),
@@ -1945,6 +2135,10 @@ defmodule Jido.Chat.Adapter do
 
   defp default_webhook_response(_), do: WebhookResponse.accepted(%{ok: true})
 
+  defp capability_callback(:uploaded_files), do: {:post_message, 3}
+  defp capability_callback(:file_requirements), do: {:file_requirements, 1}
+  defp capability_callback(:prepare_upload), do: {:prepare_upload, 3}
+  defp capability_callback(:upload_prepared), do: {:upload_prepared, 2}
   defp capability_callback(:initialize), do: {:initialize, 1}
   defp capability_callback(:authenticate), do: {:authenticate, 3}
   defp capability_callback(:shutdown), do: {:shutdown, 1}

@@ -257,6 +257,7 @@ defmodule Jido.Chat.SentMessage do
     |> Map.put_new(:attachments, [])
     |> Map.put_new(:is_mention, attrs[:is_mention] || attrs["is_mention"] || false)
     |> Map.put_new(:default_opts, [])
+    |> Map.update!(:default_opts, &retained_options/1)
   end
 
   defp thread_id(attrs, response) do
@@ -266,9 +267,12 @@ defmodule Jido.Chat.SentMessage do
 
   defp merge_opts(%__MODULE__{default_opts: defaults}, opts)
        when is_list(defaults) and is_list(opts),
-       do: Keyword.merge(defaults, opts)
+       do: Keyword.merge(retained_options(defaults), opts)
 
   defp merge_opts(_sent, opts), do: opts
+
+  defp retained_options(options) when is_list(options), do: Keyword.drop(options, [:uploaded_files])
+  defp retained_options(options), do: options
 
   defp edit_payload(%__MODULE__{} = sent, %PostPayload{} = payload, opts) do
     upload_candidates = PostPayload.upload_candidates(payload)
